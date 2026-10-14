@@ -1,700 +1,357 @@
-# PayGuard AI
+# PayOps
 
-### AI-Powered Payment Reliability, Investigation, and Recovery
+**An AI-assisted payment operations and reliability layer for small
+merchants, using PayPal Sandbox.**
 
-PayGuard AI is a payment reliability layer built around PayPal
-integration. A merchant routes supported payment operations through
-PayGuard, which uses PayPal APIs to process payments and maintains its
-own records of payment state, attempts, events, and recovery work.
+PayOps demonstrates a full payment-operations story: checkout → provider
+processing → verified outcome → AI failure analysis → safe
+reconciliation/recovery → customer communication and audit history.
 
-When a payment becomes stuck or an internal processing task repeatedly
-fails, an AI investigation agent gathers evidence from PayGuard's
-database, available PayPal information, webhook/event history, and
-connected application logs. It explains what the evidence establishes,
-what remains uncertain, and what safe next step is recommended. A
-merchant dashboard provides payment history, investigation reports,
-reliability insights, dead-letter queue (DLQ) inspection, and controlled
-recovery actions.
+> **Critical safety rule:** Never initiate another payment operation
+> merely because a request timed out or appeared to fail. First
+> establish from authoritative provider evidence and documented provider
+> semantics that the previous operation did not complete and that
+> another attempt is safe. If the outcome is unknown, reconcile or
+> escalate---never blindly retry.
 
-> **Core idea:** PayPal processes the payment. PayGuard adds
-> merchant-facing tracking, investigation, operational reliability, and
-> controlled recovery around that integration.
+## Product overview
 
-## The Problem
+PayOps has two separate experiences:
 
-A payment request can time out even if the provider processed it. A
-webhook handler can fail after the payment succeeds. A local database
-record can remain pending while the provider reports a completed
-payment. Repeating a payment blindly can risk charging a customer twice,
-while a failed background task does not necessarily mean the payment
-itself failed.
+1.  **Customer/demo storefront and checkout:** a customer chooses an
+    order and starts a PayPal Sandbox payment.
+2.  **Merchant operations dashboard:** an operator inspects payments,
+    attempts, background jobs, failures, AI investigations,
+    notifications, and audited recovery actions.
 
-Merchants need to understand what happened, what the available evidence
-proves, what remains unknown, and what action is safe.
-
-## The Solution
-
-PayGuard brings together four capabilities:
-
-1.  **PayPal payment integration:** PayGuard's backend uses supported
-    PayPal APIs for the payment flow.
-2.  **Separate PayGuard records:** A dedicated database tracks payment
-    operations, provider references, attempts, events, processing jobs,
-    investigations, and audit history.
-3.  **Reliability engine:** Asynchronous workers, durable processing,
-    bounded retries, reconciliation, and dead-letter handling for
-    eligible internal jobs.
-4.  **AI investigation and dashboard:** An agent gathers evidence using
-    controlled tools, explains individual failures, identifies recurring
-    patterns, and recommends safe next steps.
-
-The AI is not the source of truth for payment state. Provider
-information and PayGuard's durable records are evidence; deterministic
-backend rules validate and execute recovery actions.
-
-## Product Principles
-
--   PayPal remains responsible for processing the actual payment.
--   PayGuard stores only the data required to track and investigate
-    payment operations it handles; it does not need to copy the
-    merchant's entire database.
--   Evidence is gathered before diagnosis.
--   Reports distinguish confirmed facts, hypotheses, and unknowns.
--   Payment state and processing-job state are separate.
--   An uncertain payment outcome must be reconciled before another
-    charge is considered.
--   The AI recommends; backend rules enforce permissions, idempotency,
-    payment-state rules, and recovery policies.
--   Recovery actions are validated, audited, and verified.
-
-## End-to-End Flow
-
-1.  **Customer initiates payment.** The merchant application sends a
-    payment request to PayGuard.
-2.  **Validate and deduplicate.** PayGuard validates the request against
-    trusted server-side order and amount data and applies idempotency
-    rules.
-3.  **Persist the operation.** PayGuard creates its payment record and
-    an outbox event in one database transaction.
-4.  **Publish work.** An outbox publisher sends pending events to
-    RabbitMQ. This prevents a committed database record from being
-    stranded if message publication fails.
-5.  **Process payment.** A worker consumes the job and uses the
-    appropriate PayPal API flow. It records provider identifiers and
-    returned evidence.
-6.  **Record the outcome.**
-    -   Confirmed success: record the verified result.
-    -   Confirmed decline/failure: record the outcome and available
-        reason.
-    -   Timeout or ambiguous result: mark it unresolved and reconcile
-        with PayPal before considering another payment operation.
-    -   Internal processing error: apply the relevant retry policy only
-        if the operation is safe to retry.
-7.  **Process events and webhooks.** Where supported and configured,
-    PayPal webhooks provide event notifications. PayGuard verifies,
-    records, and processes them idempotently.
-8.  **Handle eligible failures.** Internal tasks may be retried with
-    bounded attempts and backoff. Jobs that exhaust the policy go to the
-    DLQ. Ambiguous payment outcomes follow a reconciliation path rather
-    than blindly repeating a charge.
-9.  **Investigate.** The merchant can investigate an individual payment
-    or review patterns across failed jobs.
-10. **Recover safely.** The backend validates an authorized action,
-    executes it, records an audit trail, and verifies the resulting
-    state.
+The backend---not a browser redirect---must verify the provider outcome.
+Customer-supplied amounts/order data must not be trusted without
+server-side validation.
 
 ## Architecture
 
 ``` text
-Customer
-   |
-Merchant Checkout
-   |
-PayGuard API ---- validates request + idempotency
-   |
-   v
-PayGuard Database (payment record + transactional outbox)
-   |
-Outbox Publisher
-   |
-RabbitMQ
-   |
-Payment Worker
-   |
-PayPal APIs
-   |
-   +---- confirmed success / confirmed failure / uncertain outcome
-                         |
-                         v
-                 Update PayGuard records
-                         |
-                         v
-                  Merchant Dashboard
+Demo store / merchant backend
+          |
+          v
+      PayOps API
+          |
+          | PostgreSQL transaction:
+          | payment record + event + outbox event
+          v
+      PostgreSQL <-------------------------------+
+          |                                      |
+          v                                      |
+    Outbox publisher                             |
+          |                                      |
+          v                                      |
+       RabbitMQ                                  |
+          |                                      |
+          v                                      |
+ Payment/processing worker                       |
+          |                                      |
+          v                                      |
+     PayPal Sandbox                              |
+          |                                      |
+          v                                      |
+ Verify and persist provider outcome ------------+
+          |
+          +-- confirmed success --> confirmation notification
+          |
+          +-- confirmed non-completion --> AI analysis
+          |                                  |
+          |                           backend safety policy
+          |                                  |
+          |                       retry only if authorized
+          |
+          +-- unknown outcome --> reconciliation/investigation
+                                  no blind payment retry
 
-
-Internal processing failures
-   |
-Bounded retry + backoff
-   |
-   +---- retry succeeds ---> job completed
-   |
-   +---- retry limit reached ---> DLQ
-                                    |
-                                    v
-                           AI Investigation Agent
-                                    |
-                    +---------------+---------------+
-                    |               |               |
-                PayGuard DB     PayPal APIs    Connected logs
-                    |               |               |
-                    +---------------+---------------+
-                                    |
-                          Evidence-backed findings
-                                    |
-                          Validated recovery action
-                                    |
-                             Audit + verification
+Dashboard --> PayOps APIs --> payment history, attempts, jobs/DLQ,
+                              AI analyses, investigations, notifications,
+                              and audit records
 ```
 
-This is a logical architecture. Webhooks, reconciliation jobs, and
-dashboard investigations may enter through different paths.
+This is a conceptual flow. Verify current official PayPal documentation
+for checkout/capture lifecycle, idempotency, webhook verification, and
+reconciliation before implementing provider-specific behavior.
 
-### Why RabbitMQ for the MVP?
+## Preferred MVP stack
 
-RabbitMQ is a practical starting point for a work-queue pattern with
-acknowledgements, retries, and dead-letter handling. Kafka is also
-viable if durable event streams, replay, and multiple independent
-consumers are central requirements. The first version should choose one
-broker, not both.
+-   Frontend: Next.js + TypeScript.
+-   Backend: Java + Spring Boot, as a **modular monolith**.
+-   Database: PostgreSQL.
+-   Messaging: RabbitMQ.
+-   Local dependencies: Docker Compose.
+-   Payment provider: PayPal Sandbox.
+-   AI: model-backed per-attempt failure analyzer plus main
+    investigation agent.
+-   Notifications: email provider selected during implementation, plus
+    dashboard/API status.
 
-### Why the transactional outbox?
+Use current supported compatible versions at project initialization.
+Exact Java/Spring Boot versions, AI provider/model, email provider, and
+final PayPal flow were not fixed in advance; verify and document
+choices. Do not introduce Kafka alongside RabbitMQ without a clear
+requirement.
 
-Writing to a database and publishing a message are two separate
-operations. If the database write succeeds but publishing fails, the
-payment can be recorded without a queued job. Persisting an outbox event
-in the same database transaction and publishing it asynchronously allows
-failed publications to be retried.
+## Core safety and reliability principles
 
-Queue durability alone does not guarantee exactly-once external payment
-execution. Workers must expect duplicate delivery and use idempotency
-and reconciliation.
+1.  **Unknown is not failed.** Timeouts, lost responses, missing
+    callbacks, and incomplete logs do not prove that payment did not
+    complete.
+2.  **AI is advisory.** It explains evidence and recommends actions.
+    Backend policy plus authoritative provider evidence determine
+    whether a retry or recovery is permitted.
+3.  **AI confidence is not authorization.** If the model is unavailable,
+    malformed, or inconclusive, preserve facts and reconcile/escalate.
+4.  **Separate payment and job states.** A payment can be successful
+    while its email/webhook-processing job is dead-lettered.
+5.  **Use idempotency** for merchant requests, broker consumers, webhook
+    processing, and notifications.
+6.  **Use a transactional outbox** for DB-to-RabbitMQ publication.
+    Expect duplicate publication and delivery.
+7.  Never hold a database transaction open across a PayPal, AI, or email
+    network call.
+8.  Store original facts separately from AI interpretation.
+9.  Retry notifications are sent only after the backend has authorized
+    and scheduled a safe retry.
+10. If the outcome is unknown, use a "we're checking your payment"
+    update if appropriate---not "payment failed" or "we're retrying."
+11. Recovery actions require backend authorization, state/policy checks,
+    and an audit record.
+12. Sanitize logs and AI context. Never expose secrets, raw provider
+    payloads, stack traces, or unnecessary personal/payment data.
 
-## Core Components
+## Main workflows
 
-### Payment API
+### Payment initiation
 
--   Accepts merchant payment requests.
--   Validates required fields and trusted order/amount data.
--   Enforces idempotency for repeated requests.
--   Creates the payment record and outbox event transactionally.
--   Returns an operation reference and current processing state.
+1.  Customer selects Pay Now.
+2.  A trusted merchant backend/integration calls PayOps.
+3.  PayOps validates merchant/order/amount and applies an idempotency
+    key.
+4.  A single PostgreSQL transaction stores the logical payment operation
+    and outbox event.
+5.  The outbox publisher sends the event to RabbitMQ.
+6.  Worker calls PayPal Sandbox using the documented provider flow.
+7.  Backend verifies and stores the outcome; a redirect alone is not
+    proof.
+8.  Confirmed success produces a single confirmation notification.
 
-### PayGuard Database
+### Failure analysis and retry gate
 
-Stores PayGuard's operational record of payments handled by the layer.
-It is separate from the merchant's database and should not unnecessarily
-duplicate customer or merchant business data.
+1.  Persist factual result, error category, timestamps,
+    correlation/provider IDs, and sanitized logs.
+2.  Build context from payment record, prior attempts, provider
+    status/evidence, webhook history, idempotency state, and relevant
+    logs.
+3.  The small AI analyzer returns an evidence-based classification,
+    explanation, missing evidence, and recommendation such as `RETRY`,
+    `RECONCILE`, `STOP`, or `INVESTIGATE`.
+4.  Persist AI output separately.
+5.  Backend validates the recommendation against provider evidence,
+    documented semantics, idempotency guarantees, payment state, policy,
+    and retry limits.
+6.  Authorize retry only when non-completion is established and another
+    attempt is safe.
+7.  Send a retry notification only after authorization and scheduling.
+8.  If unknown, reconcile. If still unresolved after bounded attempts,
+    escalate.
 
-### Outbox Publisher
+Three retries after the initial execution means up to four **job
+executions**. That is not blanket permission to create four payment
+attempts. Permanent errors should not be retried blindly.
 
-Publishes pending events to the broker and retries publication failures.
+### Reconciliation
 
-### Payment Worker
+Use a bounded, separate workflow for unknown outcomes. Reconcile using
+supported provider APIs/webhooks and relevant provider identifiers.
+Confirmed success prevents another charge. Definitive non-completion
+permits a policy evaluation. Persistent uncertainty goes to
+investigation/manual review. Reconciliation jobs may have their own DLQ
+path.
 
-Consumes queued work, checks current state, invokes supported PayPal
-operations, records outcomes, and acknowledges messages after the
-relevant durable processing step. Since a worker may crash after an
-external operation succeeds but before acknowledgement, duplicate
-delivery must be expected.
+### DLQ and investigations
 
-### PayPal Integration
+A DLQ represents exhausted background processing work---not all failed
+payments. Keep job status separate from payment status. Investigate one
+job/payment or group related jobs using structured signatures (error
+code, operation, service, time window). AI may summarize likely
+patterns, but correlation is not proof of root cause. Investigation
+tools should be narrow and primarily read-only; actual recovery goes
+through an authorized backend endpoint.
 
-Uses the supported PayPal APIs and webhook capabilities relevant to the
-selected payment flow. Exact operations, permissions, statuses,
-idempotency mechanisms, and webhook event types must be verified against
-current PayPal documentation. PayGuard must not claim access to every
-internal PayPal processing stage.
+### Notifications
 
-### Reliability Engine
+-   Confirmed success: receipt/confirmation.
+-   Retry authorized and scheduled: explain the retry and advise not to
+    submit another payment.
+-   Unknown outcome: explain that the payment is being checked and
+    status is not yet confirmed.
+-   Delayed resolution: calm update without internal DLQ/stack-trace
+    details.
+-   Confirmed failure: accurate next steps. Use notification records,
+    deduplication keys, and bounded delivery retries to prevent
+    duplicate messages.
 
--   Tracks processing jobs and attempts.
--   Classifies failures by operation and retry eligibility.
--   Schedules bounded retries with backoff.
--   Routes eligible exhausted jobs to a DLQ.
--   Triggers reconciliation for uncertain payment outcomes.
--   Keeps job status separate from payment status.
+## Initial logical data model
 
-### AI Investigation Agent
+  -----------------------------------------------------------------------
+  Entity/table                        Responsibility
+  ----------------------------------- -----------------------------------
+  `merchants`                         Merchant identity/configuration.
 
-Uses narrowly scoped backend tools to retrieve evidence and produce
-structured investigation results. It can recommend actions but cannot
-bypass authorization or payment-safety rules.
+  `payment_operations`                One logical payment, trusted
+                                      order/amount/currency, state,
+                                      provider identifiers, idempotency
+                                      data.
 
-### Merchant Dashboard
+  `payment_attempts`                  Concrete provider operations and
+                                      outcomes.
 
-Provides payment search, timelines, individual investigations,
-reliability insights, DLQ inspection, controlled recovery controls, and
-audit history.
+  `payment_events`                    Significant payment state
+                                      transitions.
 
-## Payment State vs. Processing-Job State
+  `processing_jobs`                   Background job type/state, attempt
+                                      limit, next run, completion/DLQ
+                                      data.
 
-A payment can be successful while a webhook-processing job fails. A job
-can fail before the payment outcome is known. These concepts must not
-share one status field.
+  `processing_attempts`               Execution history for jobs.
 
-### Example internal payment states
+  `outbox_events`                     Durable events to publish to
+                                      RabbitMQ.
 
-The final state machine must be defined during implementation. Possible
-states include:
+  `failure_analyses`                  AI explanation, recommendation,
+                                      evidence references, unknowns,
+                                      model/schema metadata.
 
--   `RECEIVED`
--   `QUEUED`
--   `PROCESSING`
--   `PENDING`
--   `SUCCEEDED`
--   `FAILED`
--   `UNRESOLVED`
--   `RECONCILIATION_REQUIRED`
+  `dead_letter_records`               Queryable exhausted-job history.
 
-### Example processing-job states
+  `investigation_reports`             Individual and batch
+                                      investigations.
 
--   `PENDING`
--   `PROCESSING`
--   `RETRY_SCHEDULED`
--   `COMPLETED`
--   `DEAD_LETTERED`
--   `CANCELLED`
+  `notification_records`              Notification type, dedupe key,
+                                      delivery state/history.
 
-### Example incident states
+  `audit_records`                     Operator actions,
+                                      policy/authorization decisions, and
+                                      outcomes.
+  -----------------------------------------------------------------------
 
--   `OPEN`
--   `INVESTIGATING`
--   `ACTION_REQUIRED`
--   `RESOLVED`
--   `CLOSED`
+These are starting concepts, not a mandate to create every table before
+the workflow requires it. Use migrations. Avoid a generic `dlq=true`
+flag on a payment row.
 
-These are proposed PayGuard states, not PayPal API status names.
-
-## AI Investigation
-
-PayGuard supports two primary investigation workflows.
-
-### Investigate one payment
-
-The merchant selects a payment and clicks **Investigate**. The agent can
-retrieve:
-
--   Internal payment record and state transitions.
--   Payment attempts and timestamps.
--   PayPal order/capture references and available current status.
--   PayGuard-recorded payment and webhook events.
--   Webhook receipt and processing history.
--   Related jobs and retry history.
--   Sanitized application logs, if the merchant has connected them.
-
-The report should include:
-
-1.  Summary of what is known.
-2.  Timeline of relevant events.
-3.  Evidence references supporting the findings.
-4.  Likely cause, clearly labelled as a hypothesis when unconfirmed.
-5.  Unknowns and missing evidence.
-6.  Recommended next step.
-7.  Safety considerations.
-
-**Example**
-
-> **Finding:** PayPal's available information indicates that the capture
-> completed, but PayGuard's internal record remains pending. The
-> original request timed out and the expected local update is not
-> recorded.
->
-> **Recommended action:** Reconcile the internal record against the
-> confirmed provider outcome and inspect webhook-processing history. Do
-> not initiate another charge.
-
-### Analyse recurring DLQ failures
-
-The system can examine dead-lettered jobs, error metadata, retry
-histories, job types, timestamps, and related payment references. The AI
-can group similar error signatures and explain recurring patterns, such
-as database connectivity failures, missing internal references,
-webhook-processing errors, or configuration problems.
-
-The AI should recommend investigations rather than claim an unproven
-root cause. It must not automatically replay every job.
-
-### Proposed internal tool contracts
-
-These are conceptual tools to implement in PayGuard, not names of
-PayPal-provided AI tools:
-
--   `get_payment_record(payment_id)`
--   `get_payment_attempts(payment_id)`
--   `get_payment_events(payment_id)`
--   `get_paypal_payment_status(provider_reference)`
--   `get_webhook_history(payment_id)`
--   `get_processing_job(job_id)`
--   `get_retry_history(job_id)`
--   `get_related_jobs(payment_id, error_signature)`
--   `get_sanitized_diagnostics(payment_id, time_range)`
--   `request_reconciliation(payment_id)`
--   `request_job_replay(job_id)`
--   `create_investigation_report(payment_id)`
-
-Read-only evidence tools should be separated from state-changing tools.
-Action tools must enforce authentication, authorization, validation,
-idempotency where applicable, and audit logging. Risky actions may
-require human approval.
-
-## Retry and Dead-Letter Queue
-
-Retries apply to **eligible internal processing jobs**, not
-indiscriminately to every payment operation.
+## Proposed repository layout
 
 ``` text
-Internal job received
-        |
-     Attempt 1 fails
-        |
-  Retry with backoff
-        |
-     Attempt 2 fails
-        |
-  Retry with backoff
-        |
-     Attempt 3 fails
-        |
-   Retry limit reached
-        |
-        v
-       DLQ
-        |
-        v
-Investigate + validate recovery
+PayOps/
+├── README.md
+├── information.md
+├── .gitignore
+├── .env.example
+├── frontend/                         # Next.js + TypeScript
+│   └── src/
+│       ├── app/
+│       │   ├── page.tsx
+│       │   ├── shop/page.tsx
+│       │   ├── checkout/page.tsx
+│       │   ├── payment-result/page.tsx
+│       │   └── dashboard/
+│       │       ├── page.tsx
+│       │       ├── payments/page.tsx
+│       │       ├── investigations/page.tsx
+│       │       ├── investigations/[id]/page.tsx
+│       │       └── dlq/page.tsx
+│       ├── components/{ui,checkout,payments,dashboard,investigations,dlq}/
+│       ├── features/{payments,investigations,reliability,dlq}/
+│       ├── lib/{api.ts,types.ts}
+│       └── hooks/
+├── payment-service/                   # one Spring Boot backend
+│   ├── pom.xml
+│   └── src/
+│       ├── main/java/com/payops/
+│       │   ├── PayOpsApplication.java
+│       │   ├── config/  common/  merchant/
+│       │   ├── payment/ paypal/ processing/
+│       │   ├── messaging/ outbox/ retry/ dlq/
+│       │   ├── diagnostics/ investigation/
+│       │   ├── notification/ audit/ observability/
+│       ├── main/resources/
+│       │   ├── application.yml
+│       │   └── db/migration/
+│       └── test/java/com/payops/
+├── infrastructure/
+│   └── docker-compose.yml              # PostgreSQL + RabbitMQ
+├── docs/
+│   ├── architecture/
+│   ├── api/
+│   └── demo-scenarios/
+└── scripts/
 ```
 
-Three attempts are an example MVP configuration, not a universal rule.
-Use bounded retries, backoff, and error classification so permanent
-failures are not repeatedly retried.
-
-Important safeguards:
-
--   Retrying a webhook handler must not charge the customer again.
--   A timeout during a payment operation is ambiguous, not proof of
-    failure.
--   Reconcile with PayPal before considering another payment operation
-    after an uncertain result.
--   Do not acknowledge and discard a message before required durable
-    processing is complete.
--   Expect duplicate message delivery and make consumers idempotent.
--   Keep authoritative attempt counts and job states in durable records.
--   DLQ replay must be explicit, audited, and guarded by safety checks.
-
-## Data Model
-
-A conceptual starting model:
-
-### `PaymentOperation`
-
--   `payment_id`
--   `merchant_id`
--   `merchant_order_id`
--   `idempotency_key`
--   `amount`
--   `currency`
--   `payment_status`
--   `provider`
--   `provider_order_id`
--   `provider_capture_id`
--   `created_at`
--   `updated_at`
-
-### `PaymentAttempt`
-
--   `attempt_id`
--   `payment_id`
--   `attempt_type`
--   `started_at`
--   `finished_at`
--   `outcome`
--   `error_code`
--   `provider_debug_reference`, where available
--   `retry_eligible`
-
-Distinguish customer-initiated attempts from internal retries and
-reconciliation calls.
-
-### `PaymentEvent`
-
--   `event_id`
--   `payment_id`
--   `event_type`
--   `source`
--   `occurred_at`
--   `received_at`
--   `correlation_id`
--   `sanitized_payload_reference`
-
-### `ProcessingJob`
-
--   `job_id`
--   `payment_id`
--   `job_type`
--   `job_status`
--   `attempt_count`
--   `max_attempts`
--   `last_error`
--   `next_attempt_at`
--   `created_at`
--   `updated_at`
-
-### `Incident`
-
--   `incident_id`
--   `payment_id`, where applicable
--   `incident_type`
--   `severity`
--   `status`
--   `summary`
--   `evidence_references`
--   `created_at`
--   `resolved_at`
-
-### `RecoveryAction` and `AuditRecord`
-
-Track action type and target, requesting actor, approval where required,
-validation result, execution result, before/after state references,
-timestamps, and correlation IDs.
-
-### `OutboxEvent`
-
-Track the event ID, aggregate ID, event type, payload reference, publish
-status, creation time, and publication time.
-
-The final schema should be adapted to the selected database and
-implementation.
-
-## Dashboard Experience
-
-### 1. Payment Overview
-
-Recent payments, amounts, states, unresolved/inconsistent records,
-investigations needed, and jobs awaiting retry or in the DLQ.
-
-### 2. Payment Investigation
-
-A timeline of events, internal and provider-side status, attempts,
-errors, webhook history, connected diagnostics, and an AI report with
-evidence and uncertainty clearly shown.
-
-### 3. Reliability Insights
-
-Retry outcomes, DLQ size and age, repeated error signatures, recurring
-patterns, and recommended investigations.
-
-### 4. Recovery Operations
-
-Inspect eligible jobs, request controlled replay, request payment
-reconciliation, and review approvals, action results, and audit history.
-
-The dashboard must not imply that a merchant can change PayPal's
-internal state. It shows available evidence and controls only the
-actions exposed and authorized by PayGuard.
-
-## Security and Reliability
-
--   Keep PayPal credentials server-side; never expose secrets to the
-    browser or AI context.
--   Verify webhook signatures and process duplicate webhook deliveries
-    idempotently.
--   Enforce authentication and merchant-level authorization on all
-    operations.
--   Validate amounts and order ownership using trusted backend data.
--   Treat provider timeouts as ambiguous until reconciled.
--   Combine durable database records, outbox publishing, persistent
-    broker messages, acknowledgements, and retry policies.
--   Redact tokens, secrets, and unnecessary personal data from logs and
-    AI context.
--   Limit the AI to the minimum data and tools needed.
--   Keep state-changing operations behind deterministic backend
-    validation.
--   Audit recovery requests and outcomes.
--   Investigate only information exposed through supported APIs,
-    webhooks, and authorized integrations.
-
-## MVP Scope
-
-### Build
-
-1.  A reference merchant checkout.
-2.  A working PayPal Sandbox payment flow through PayGuard.
-3.  A separate PayGuard database.
-4.  Idempotent payment request handling.
-5.  RabbitMQ asynchronous processing.
-6.  Transactional outbox publishing.
-7.  Payment state and event history.
-8.  PayPal status lookup/reconciliation for the selected flow.
-9.  Bounded retries and a DLQ for eligible internal jobs.
-10. An AI agent with controlled investigation tools.
-11. A merchant dashboard for payments, investigations, DLQ analysis, and
-    safe recovery.
-12. Deterministic failure simulation and tests.
-
-### Defer
-
--   Plug-and-play access to arbitrary merchant databases.
--   Support for every payment method or PayPal integration flow.
--   Integrations with every logging provider.
--   Multiple message brokers.
--   Unrestricted autonomous recovery.
--   Automatic replay of ambiguous payment operations.
-
-## Demo Scenarios
-
-### 1. Provider succeeded, local state is stale
-
-Simulate a confirmed provider outcome while the local state update or
-event handler fails. Show PayGuard detecting the inconsistency,
-gathering evidence, and reconciling safely without another charge.
-
-### 2. Webhook-processing job enters the DLQ
-
-Simulate an internal webhook-handler failure and exhaust the configured
-retries. Show the job in the DLQ, the AI analysing the attempt history
-and related payment, and a validated recovery option.
-
-### 3. Payment outcome is uncertain
-
-Simulate a timeout at the application boundary. Do not assume PayPal
-failed. Show the agent checking available provider information and
-either reporting the verified outcome or leaving it unresolved with a
-recommendation for further verification.
-
-### 4. Many DLQ jobs share a failure pattern
-
-Create multiple controlled jobs with the same internal failure
-signature. Show the dashboard grouping the failures and the AI
-explaining the common pattern and next diagnostic step.
-
-Clearly label simulated application failures as simulations; do not
-present them as real PayPal outages.
-
-## Suggested Implementation Plan
-
-### Phase 1 --- Payment foundation
-
-Set up PayPal Sandbox, the reference checkout, PayGuard API, idempotency
-behaviour, payment schema, and state machine.
-
-### Phase 2 --- Durable asynchronous processing
-
-Add RabbitMQ, the transactional outbox, publisher, payment worker,
-acknowledgements, and duplicate-delivery handling.
-
-### Phase 3 --- Provider evidence and reconciliation
-
-Store PayPal identifiers and responses, implement the relevant status
-lookups and webhooks, verify webhook authenticity, and build the
-uncertain-outcome reconciliation path.
-
-### Phase 4 --- Reliability operations
-
-Add processing-job records, error classification, bounded retries,
-backoff, DLQ routing, controlled replay, and audit logging.
-
-### Phase 5 --- AI investigation
-
-Implement read-only evidence tools, a structured evidence bundle and
-report, explicit distinction between facts/hypotheses/unknowns, and
-guarded action tools after backend safety checks exist.
-
-### Phase 6 --- Dashboard and demo
-
-Build payment overview, transaction timelines, individual investigation,
-DLQ insights, recovery controls, and tests for the demo scenarios.
-
-## Technology Choices
-
-  -----------------------------------------------------------------------
-  Layer                   Suggested choice        Reason
-  ----------------------- ----------------------- -----------------------
-  Backend API             Java + Spring Boot      API, transaction, and
-                                                  integration logic
-
-  Database                PostgreSQL              Transactions,
-                                                  constraints, durable
-                                                  records, and outbox
-                                                  pattern
-
-  Message broker          RabbitMQ                Work queues,
-                                                  acknowledgements,
-                                                  retry/DLQ patterns
-
-  Payment provider        PayPal Sandbox          Test the supported
-                                                  PayPal payment flow
-
-  AI                      Tool-calling LLM        Evidence gathering and
-                                                  investigation
-
-  Dashboard               Next.js + TypeScript    Merchant-facing
-                                                  interface
-
-  Observability           Structured logs +       Link requests, jobs,
-                          correlation IDs         events, and
-                                                  investigations
-  -----------------------------------------------------------------------
-
-These are proposed choices, not hard requirements. Choose one broker and
-keep the MVP small enough to finish and demonstrate.
-
-## Limitations and Non-Goals
-
--   PayGuard does not replace PayPal or independently settle funds.
--   It cannot inspect PayPal's private internal infrastructure unless
-    relevant information is explicitly exposed through supported
-    capabilities.
--   Merchant application logs are available only when collected or
-    connected with authorization.
--   Merchant databases are not automatically accessible; integration
-    requires a defined API, adapter, or explicit permission.
--   AI diagnosis can be uncertain and must not invent certainty.
--   A DLQ is for work that could not be processed under its policy; it
-    is not a bucket for every failed payment.
--   Queue durability does not alone guarantee exactly-once external
-    payment execution.
--   Recovery actions require validation, authorization, idempotency, and
-    audit controls.
-
-## Success Criteria
-
-The MVP should demonstrate that:
-
--   A customer can complete a PayPal Sandbox payment through PayGuard.
--   Duplicate submissions do not create duplicate logical payment
-    operations.
--   Payment records and queue publication survive designed failure
-    cases.
--   Uncertain outcomes are not blindly retried as new charges.
--   Eligible internal jobs follow bounded retries and reach the DLQ when
-    appropriate.
--   The AI uses internal evidence and available PayPal information to
-    produce traceable investigations.
--   The dashboard explains individual payment issues and recurring DLQ
-    patterns clearly.
--   Recovery actions are validated, audited, and verified.
-
-## Positioning
-
-**PayGuard AI is an AI-powered payment reliability and investigation
-layer built around PayPal integration.**
-
-It combines payment processing, durable asynchronous work, internal
-state tracking, provider-state reconciliation, controlled retries,
-dead-letter analysis, and evidence-backed AI investigations in one
-merchant-facing workflow.
-
-The differentiator is not simply displaying payment statuses. It is
-helping a merchant understand **what happened, what the evidence
-establishes, what remains uncertain, and what safe action should happen
-next**.
+This is a guide, not evidence that files already exist. Inspect the
+repository first, preserve existing work, and add packages incrementally
+rather than creating empty folders in advance.
+
+## Implementation milestones
+
+1.  Inspect repository, existing README/configuration, Git status,
+    tests, and official provider documentation.
+2.  Present the mandatory pre-implementation briefing described in
+    `information.md`; wait for explicit approval before changing files.
+3.  Establish frontend/backend foundations and Docker Compose
+    dependencies.
+4.  Add migrations, domain models, API validation, health checks, and
+    error handling.
+5.  Implement a minimal PayPal Sandbox flow with server-side outcome
+    verification.
+6.  Add transactional outbox, RabbitMQ consumers, job/attempt history,
+    and idempotency.
+7.  Implement explicit unknown outcomes and reconciliation before
+    enabling payment retries.
+8.  Add the AI analyzer, stored evidence-grounded analyses, and safe
+    fallback behavior.
+9.  Add notifications and deduplication.
+10. Add dashboard, investigation agent, DLQ views, controlled recovery,
+    and audit.
+11. Test duplicate delivery, timeout ambiguity, success-after-timeout,
+    AI outage, notification duplication, and recovery authorization.
+12. Document a repeatable demo and honest limitations.
+
+## Minimum acceptance criteria
+
+-   Verified PayPal Sandbox outcome is recorded.
+-   Browser redirect alone never marks payment successful.
+-   Repeated merchant request with the same idempotency key does not
+    create a duplicate logical payment.
+-   Duplicate broker deliveries do not repeat business side effects.
+-   Unknown timeout outcome enters reconciliation, not a new payment
+    attempt.
+-   Confirmed success discovered during reconciliation prevents another
+    charge.
+-   A retry requires authoritative evidence plus backend policy
+    authorization.
+-   AI failure/uncertainty cannot authorize retry.
+-   Retry notification is sent only after retry authorization and
+    scheduling.
+-   Payment state remains independent from processing-job/DLQ state.
+-   Notification redelivery does not send duplicate logical messages.
+-   Recovery is permission-checked and audited.
+-   Sensitive data is redacted from logs and AI context.
+-   Automated tests cover safety-critical failure paths.
+
+## Configuration and security
+
+Use environment variables and provide `.env.example` with placeholder
+names only. Keep `.env` and all credentials out of version control. Use
+synthetic data and PayPal Sandbox. Select AI and email providers based
+on current documentation and constraints; document data sent to those
+providers, required credentials, and any material cost. Do not claim a
+test, build, or provider flow succeeded unless it was actually run and
+verified.
+
+For the full product context, agent autonomy rules, detailed AI
+behavior, test scenarios, and the mandatory approval checkpoint, read
+[`information.md`](./information.md).
